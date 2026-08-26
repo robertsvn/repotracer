@@ -127,9 +127,11 @@ impl CliScout {
             "--disable",
             "plugins",
             "--config",
-            "approval_policy=\"never\"",
+            "approval_policy=\"on-request\"",
             "--config",
-            "default_permissions=\":read-only\"",
+            "approvals_reviewer=\"auto_review\"",
+            "--config",
+            "default_permissions=\":workspace\"",
             "--config",
             "project_doc_max_bytes=0",
             "--config",
@@ -154,13 +156,16 @@ impl CliScout {
             bail!("repository root does not exist: {}", request.root.display());
         }
         let started = Instant::now();
+        let git_snapshot = GitSnapshot::capture(&request.root).await?;
         let response = self
             .run_app_server(
                 &request.root,
                 &self.prompt(&request),
                 request.timeout.or(self.timeout),
             )
-            .await?;
+            .await;
+        GitSnapshot::ensure_unchanged(&request.root, git_snapshot).await?;
+        let response = response?;
         let raw = response.raw;
         let structured: StructuredOutput =
             serde_json::from_str(&raw).context("Codex returned malformed structured output")?;
@@ -324,13 +329,15 @@ where
         &json!({"id": 2, "method": "thread/start", "params": {
             "cwd": cwd,
             "ephemeral": true,
-            "approvalPolicy": "never",
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "auto_review",
             "developerInstructions": APP_SERVER_INSTRUCTIONS,
             "model": model,
             "serviceTier": "default",
             "config": {
-                "approval_policy": "never",
-                "default_permissions": ":read-only",
+                "approval_policy": "on-request",
+                "approvals_reviewer": "auto_review",
+                "default_permissions": ":workspace",
                 "project_doc_max_bytes": 0
             }
         }}),
@@ -416,6 +423,80 @@ where
             _ => {}
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GitSnapshot {
+    status: Vec<u8>,
+    unstaged_diff: Vec<u8>,
+    staged_diff: Vec<u8>,
+}
+
+impl GitSnapshot {
+    async fn capture(root: &Path) -> Result<Option<Self>> {
+        let probe = match Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(root)
+            .output()
+            .await
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("could not inspect repository state"),
+        };
+        if !probe.status.success() || probe.stdout != b"true\n" && probe.stdout != b"true\r\n" {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            status: git_output(
+                root,
+                &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            )
+            .await?,
+            unstaged_diff: git_output(root, &["diff", "--no-ext-diff", "--binary", "--no-color"])
+                .await?,
+            staged_diff: git_output(
+                root,
+                &[
+                    "diff",
+                    "--cached",
+                    "--no-ext-diff",
+                    "--binary",
+                    "--no-color",
+                ],
+            )
+            .await?,
+        }))
+    }
+
+    async fn ensure_unchanged(root: &Path, before: Option<Self>) -> Result<()> {
+        let Some(before) = before else {
+            return Ok(());
+        };
+        let after = Self::capture(root).await?;
+        if after.as_ref() != Some(&before) {
+            bail!("Codex repository scout changed Git-visible repository state; result discarded");
+        }
+        Ok(())
+    }
+}
+
+async fn git_output(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .await
+        .with_context(|| format!("could not run `git {}`", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "`git {}` failed while checking for scout mutations: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
 }
 
 async fn wait_for_response<R, W>(stdin: &mut W, lines: &mut Lines<R>, id: u64) -> Result<Value>
@@ -651,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_args_are_read_only_and_isolated() {
+    fn provider_args_use_auto_review_workspace_and_are_isolated() {
         let mut codex_config = config("codex-cli", Path::new("codex"));
         codex_config.model.model = "gpt-5.6-luna".into();
         codex_config.model.reasoning_effort = "medium".into();
@@ -683,7 +764,13 @@ mod tests {
             .any(|pair| pair == ["--config", "project_doc_max_bytes=0"]));
         assert!(codex_args
             .windows(2)
-            .any(|pair| pair == ["--config", "default_permissions=\":read-only\""]));
+            .any(|pair| pair == ["--config", "approval_policy=\"on-request\""]));
+        assert!(codex_args
+            .windows(2)
+            .any(|pair| pair == ["--config", "approvals_reviewer=\"auto_review\""]));
+        assert!(codex_args
+            .windows(2)
+            .any(|pair| pair == ["--config", "default_permissions=\":workspace\""]));
         assert!(codex_args
             .windows(2)
             .any(|pair| pair == ["--config", "service_tier=\"default\""]));
@@ -742,6 +829,36 @@ mod tests {
         assert!(prompt.contains("implementation and tests first"));
         assert_eq!(output_schema()["properties"]["citations"]["maxItems"], 5);
         assert_eq!(output_schema()["properties"]["answer"]["maxLength"], 3000);
+    }
+
+    #[tokio::test]
+    async fn git_snapshot_detects_tracked_worktree_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("source.rs"), "before\n").unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .args(["add", "source.rs"])
+            .current_dir(root.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let before = GitSnapshot::capture(root.path()).await.unwrap().unwrap();
+        std::fs::write(root.path().join("source.rs"), "after\n").unwrap();
+        let after = GitSnapshot::capture(root.path()).await.unwrap().unwrap();
+
+        assert_ne!(before, after);
+        let error = GitSnapshot::ensure_unchanged(root.path(), Some(before))
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed Git-visible repository state"));
     }
 
     #[cfg(unix)]
